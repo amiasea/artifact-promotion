@@ -34,7 +34,7 @@ module "strata_hosting" {
 module "strata_collective" {
   source                    = var.strata_collective_module_source
   version                   = var.strata_collective_module_version
-  azure_resource_group_name = data.azurerm_resource_group.target.name
+  # azure_resource_group_name = data.azurerm_resource_group.target.name
 
   depends_on = [azapi_update_resource.resource_group_tags]
 }
