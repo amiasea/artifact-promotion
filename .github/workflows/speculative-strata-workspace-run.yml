@@ -1,0 +1,133 @@
+name: Speculative Strata Workspace Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      strata_pr_number:
+        description: "Strata pull request number."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+jobs:
+  run-workspace:
+    name: Run Speculative Strata HCP Terraform Workspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ inputs.strata_pr_number }}
+        run: |
+          response=$(gh api "repos/amiasea/strata-artifact/pulls/${PULL_REQUEST_NUMBER}")
+
+          base_branch=$(echo "$response" | jq -r '.base.ref')
+          state=$(echo "$response" | jq -r '.state')
+
+          if [ "$state" != "open" ]; then
+            echo "Pull request #${PULL_REQUEST_NUMBER} is not open."
+            exit 1
+          fi
+
+          if [ "$base_branch" != "development" ]; then
+            echo "Pull request #${PULL_REQUEST_NUMBER} targets '${base_branch}', expected 'development'."
+            exit 1
+          fi
+
+          echo "Pull request #${PULL_REQUEST_NUMBER} targets development."
+
+      - name: Authenticate to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
+
+      - name: Read TFE token from Sovereign Key Vault
+        id: secrets
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            token=$(az keyvault secret show \
+              --vault-name "kv-amiasea-sovereign" \
+              --name "amiasea-tfe-org-token" \
+              --query value \
+              --output tsv)
+
+            echo "::add-mask::$token"
+            echo "TFE_TOKEN=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Find Speculative Strata Workspace
+        id: workspace
+        env:
+          TFE_TOKEN: ${{ steps.secrets.outputs.TFE_TOKEN }}
+          TFE_ORGANIZATION: amiasea
+          PULL_REQUEST_NUMBER: ${{ inputs.strata_pr_number }}
+        run: |
+          workspace_name="sp-s-${PULL_REQUEST_NUMBER}"
+
+          response=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request GET \
+            --header "Authorization: Bearer ${TFE_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${TFE_ORGANIZATION}/workspaces/${workspace_name}")
+
+          workspace_id=$(echo "$response" | jq -r '.data.id')
+
+          if [ -z "$workspace_id" ] || [ "$workspace_id" = "null" ]; then
+            echo "Speculative Strata workspace '${workspace_name}' does not exist."
+            exit 1
+          fi
+
+          echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+
+          echo "Found workspace: ${workspace_name}"
+          echo "Workspace ID: ${workspace_id}"
+
+      - name: Trigger Speculative Run
+        env:
+          TFE_TOKEN: ${{ steps.secrets.outputs.TFE_TOKEN }}
+          WORKSPACE_ID: ${{ steps.workspace.outputs.workspace_id }}
+        run: |
+          response=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${TFE_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data '{
+              "data": {
+                "type": "runs",
+                "attributes": {
+                  "message": "Speculative run triggered by strata pull request update."
+                },
+                "relationships": {
+                  "workspace": {
+                    "data": {
+                      "type": "workspaces",
+                      "id": "'"${WORKSPACE_ID}"'"
+                    }
+                  }
+                }
+              }
+            }' \
+            "https://app.terraform.io/api/v2/runs"
+
+          run_id=$(echo "$response" | jq -r '.data.id')
+
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "Failed to create run."
+            echo "$response"
+            exit 1
+          fi
+
+          echo "Speculative run triggered: ${run_id}"

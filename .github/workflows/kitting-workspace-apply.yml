@@ -1,0 +1,86 @@
+name: Kitting Workspace Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      azure_resource_group_name:
+        description: "Target resource group name."
+        required: true
+        type: string
+
+      kitting_module_source:
+        description: "Kitting module source."
+        required: true
+        type: string
+
+      kitting_module_version:
+        description: "Kitting module version, when applicable."
+        required: false
+        type: string
+
+      artifact_metadata_json:
+        description: "Kitting artifact metadata JSON."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  apply-workspace:
+    name: Apply Kitting Workspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Artifact Promotion Repo
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Inject Configuration Variables
+        working-directory: kitting-workspace-template
+        env:
+          AZURE_RESOURCE_GROUP_NAME: ${{ inputs.azure_resource_group_name }}
+          KITTING_MODULE_SOURCE: ${{ inputs.kitting_module_source }}
+          KITTING_MODULE_VERSION: ${{ inputs.kitting_module_version }}
+          ARTIFACT_METADATA_JSON: ${{ inputs.artifact_metadata_json }}
+        run: |
+          jq -n \
+            --arg resource_group_name "$AZURE_RESOURCE_GROUP_NAME" \
+            --arg module_source "$KITTING_MODULE_SOURCE" \
+            --arg module_version "$KITTING_MODULE_VERSION" \
+            --arg metadata "$ARTIFACT_METADATA_JSON" \
+            '{
+              azure_resource_group_name: $resource_group_name,
+              kitting_module_source: $module_source,
+              kitting_module_version: (
+                if $module_version == "" then null else $module_version end
+              ),
+              artifact_metadata_json: $metadata
+            }' > kitting.auto.tfvars.json
+
+          echo "Generated kitting.auto.tfvars.json:"
+          cat kitting.auto.tfvars.json
+
+      - name: Compress Workspace Directory
+        run: |
+          tar -czf payload.tar.gz kitting-workspace-template
+
+      - name: Authenticate to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
+
+      - name: Apply Kitting Configuration
+        working-directory: kitting-workspace-template
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
+        run: |
+          terraform init
+          terraform apply \
+            -auto-approve \
+            -var-file=kitting.auto.tfvars.json

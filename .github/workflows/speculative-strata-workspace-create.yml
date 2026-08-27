@@ -1,0 +1,225 @@
+name: Speculative Strata Workspace Create
+
+on:
+  workflow_dispatch:
+    inputs:
+      strata_pr_number:
+        description: "Strata pull request number."
+        required: true
+        type: string
+      azure_resource_group_name:
+        description: "Assigned speculative resource group name."
+        required: true
+        type: string
+      strata_hosting_module_source:
+        description: "Strata hosting module source."
+        required: true
+        type: string
+      strata_hosting_module_version:
+        description: "Strata hosting module version, when applicable."
+        required: false
+        type: string
+      strata_collective_module_source:
+        description: "Strata collective module source."
+        required: true
+        type: string
+      strata_collective_module_version:
+        description: "Strata collective module version, when applicable."
+        required: false
+        type: string
+      artifact_metadata_json:
+        description: "Strata artifact metadata JSON."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+jobs:
+  create-workspace:
+    name: Create Speculative Strata HCP Terraform Workspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ inputs.strata_pr_number }}
+        run: |
+          response=$(gh api "repos/amiasea/strata-artifact/pulls/${PULL_REQUEST_NUMBER}")
+
+          base_branch=$(echo "$response" | jq -r '.base.ref')
+          state=$(echo "$response" | jq -r '.state')
+
+          if [ "$state" != "open" ]; then
+            echo "Pull request #${PULL_REQUEST_NUMBER} is not open."
+            exit 1
+          fi
+
+          if [ "$base_branch" != "development" ]; then
+            echo "Pull request #${PULL_REQUEST_NUMBER} targets '${base_branch}', expected 'development'."
+            exit 1
+          fi
+
+          echo "Pull request #${PULL_REQUEST_NUMBER} targets development."
+
+      - name: Checkout Artifact Promotion Repo
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Inject Configuration Variables
+        working-directory: strata-workspace-template
+        env:
+          AZURE_RESOURCE_GROUP_NAME: ${{ inputs.azure_resource_group_name }}
+          STRATA_HOSTING_MODULE_SOURCE: ${{ inputs.strata_hosting_module_source }}
+          STRATA_HOSTING_MODULE_VERSION: ${{ inputs.strata_hosting_module_version }}
+          STRATA_COLLECTIVE_MODULE_SOURCE: ${{ inputs.strata_collective_module_source }}
+          STRATA_COLLECTIVE_MODULE_VERSION: ${{ inputs.strata_collective_module_version }}
+          ARTIFACT_METADATA_JSON: ${{ inputs.artifact_metadata_json }}
+        run: |
+          jq -n \
+            --arg resource_group_name "$AZURE_RESOURCE_GROUP_NAME" \
+            --arg hosting_source "$STRATA_HOSTING_MODULE_SOURCE" \
+            --arg hosting_version "$STRATA_HOSTING_MODULE_VERSION" \
+            --arg collective_source "$STRATA_COLLECTIVE_MODULE_SOURCE" \
+            --arg collective_version "$STRATA_COLLECTIVE_MODULE_VERSION" \
+            --arg metadata "$ARTIFACT_METADATA_JSON" \
+            '{
+              azure_resource_group_name: $resource_group_name,
+              strata_hosting_module_source: $hosting_source,
+              strata_hosting_module_version: (
+                if $hosting_version == "" then null else $hosting_version end
+              ),
+              strata_collective_module_source: $collective_source,
+              strata_collective_module_version: (
+                if $collective_version == "" then null else $collective_version end
+              ),
+              artifact_metadata_json: $metadata
+            }' > speculative.auto.tfvars.json
+
+          echo "Generated speculative.auto.tfvars.json:"
+          cat speculative.auto.tfvars.json
+
+      - name: Compress Workspace Directory
+        run: |
+          tar -czf payload.tar.gz speculative-strata-workspace-template
+
+      - name: Authenticate to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
+
+      - name: Read TFE token from Sovereign Key Vault
+        id: secrets
+        uses: azure/cli@v3
+        with:
+          inlineScript: |
+            token=$(az keyvault secret show \
+              --vault-name "kv-amiasea-sovereign" \
+              --name "amiasea-tfe-org-token" \
+              --query value \
+              --output tsv)
+
+            echo "::add-mask::$token"
+            echo "TFE_TOKEN=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Create HCP Terraform Workspace
+        id: workspace
+        env:
+          TFE_TOKEN: ${{ steps.secrets.outputs.TFE_TOKEN }}
+          TFE_ORGANIZATION: amiasea
+          TFE_PROJECT_ID: ${{ vars.TFE_SPECULATIVE_PROJECT_ID }}
+          PULL_REQUEST_NUMBER: ${{ inputs.strata_pr_number }}
+        run: |
+          workspace_name="sp-s-${PULL_REQUEST_NUMBER}"
+
+          jq -n \
+            --arg name "$workspace_name" \
+            --arg project_id "$TFE_PROJECT_ID" \
+            '{
+              data: {
+                type: "workspaces",
+                attributes: {
+                  name: $name,
+                  "execution-mode": "remote",
+                  "auto-apply": false
+                },
+                relationships: {
+                  project: {
+                    data: {
+                      type: "projects",
+                      id: $project_id
+                    }
+                  }
+                }
+              }
+            }' > workspace.json
+
+          response=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${TFE_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data @workspace.json \
+            "https://app.terraform.io/api/v2/organizations/${TFE_ORGANIZATION}/workspaces")
+
+          workspace_id=$(echo "$response" | jq -r '.data.id')
+
+          if [ -z "$workspace_id" ] || [ "$workspace_id" = "null" ]; then
+            echo "Failed to create workspace."
+            echo "$response"
+            exit 1
+          fi
+
+          echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+
+          echo "Workspace created: ${workspace_name}"
+          echo "Workspace ID: ${workspace_id}"
+
+      - name: Upload Configuration and Trigger Speculative Run
+        env:
+          TFE_TOKEN: ${{ steps.secrets.outputs.TFE_TOKEN }}
+          WORKSPACE_ID: ${{ steps.workspace.outputs.workspace_id }}
+        run: |
+          cv_response=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${TFE_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data '{
+              "data": {
+                "type": "configuration-versions",
+                "attributes": {
+                  "speculative": true
+                }
+              }
+            }' \
+            "https://app.terraform.io/api/v2/workspaces/${WORKSPACE_ID}/configuration-versions")
+
+          upload_url=$(echo "$cv_response" | jq -r '.data.attributes."upload-url"')
+
+          if [ -z "$upload_url" ] || [ "$upload_url" = "null" ]; then
+            echo "Failed to obtain configuration upload URL."
+            echo "$cv_response"
+            exit 1
+          fi
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request PUT \
+            --header "Content-Type: application/octet-stream" \
+            --data-binary @"payload.tar.gz" \
+            "$upload_url"
+
+          echo "Payload uploaded successfully. Speculative plan queued."
