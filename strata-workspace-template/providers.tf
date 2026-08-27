@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 5.1.0"
     }
+    azapi = {
+      source  = "azure/azapi"
+      version = "~> 2.12.0"
+    }
   }
 }
 
@@ -16,4 +20,11 @@ provider "azurerm" {
   use_oidc              = true
 
   features {}
+}
+
+provider "azapi" {
+  tenant_id       = var.azure_tenant_id
+  subscription_id = var.azure_subscription_id
+
+  use_oidc = true
 }
