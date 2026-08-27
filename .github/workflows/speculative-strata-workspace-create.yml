@@ -105,7 +105,8 @@ jobs:
 
       - name: Compress Workspace Directory
         run: |
-          tar -czf payload.tar.gz strata-workspace-template
+          cd strata-workspace-template
+          tar -czf ../payload.tar.gz .
 
       - name: Authenticate to Azure
         uses: azure/login@v3
