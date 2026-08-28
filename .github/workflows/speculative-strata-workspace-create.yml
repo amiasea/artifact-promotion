@@ -129,7 +129,7 @@ jobs:
             echo "::add-mask::$token"
             echo "TFE_TOKEN=$token" >> "$GITHUB_OUTPUT"
 
-      - name: Create HCP Terraform Workspace
+      - name: Get or Create HCP Terraform Workspace
         id: workspace
         env:
           TFE_TOKEN: ${{ steps.secrets.outputs.TFE_TOKEN }}
@@ -138,6 +138,44 @@ jobs:
           PULL_REQUEST_NUMBER: ${{ inputs.strata_pr_number }}
         run: |
           workspace_name="sp-s-${PULL_REQUEST_NUMBER}"
+          workspace_url="https://app.terraform.io/api/v2/organizations/${TFE_ORGANIZATION}/workspaces/${workspace_name}"
+
+          echo "Looking for workspace: ${workspace_name}"
+
+          get_response=$(curl \
+            --silent \
+            --show-error \
+            --request GET \
+            --header "Authorization: Bearer ${TFE_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --write-out "\n%{http_code}" \
+            "$workspace_url")
+
+          get_status=$(echo "$get_response" | tail -n 1)
+          get_body=$(echo "$get_response" | sed '$d')
+
+          if [ "$get_status" = "200" ]; then
+            workspace_id=$(echo "$get_body" | jq -r '.data.id')
+
+            if [ -z "$workspace_id" ] || [ "$workspace_id" = "null" ]; then
+              echo "Workspace exists but its ID could not be determined."
+              echo "$get_body"
+              exit 1
+            fi
+
+            echo "Workspace already exists: ${workspace_name}"
+            echo "Workspace ID: ${workspace_id}"
+            echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$get_status" != "404" ]; then
+            echo "Failed to retrieve workspace."
+            echo "$get_body"
+            exit 1
+          fi
+
+          echo "Workspace does not exist. Creating ${workspace_name}..."
 
           jq -n \
             --arg name "$workspace_name" \
@@ -161,34 +199,74 @@ jobs:
               }
             }' > workspace.json
 
-          response=$(curl \
-            --fail \
+          create_response=$(curl \
             --silent \
             --show-error \
             --request POST \
             --header "Authorization: Bearer ${TFE_TOKEN}" \
             --header "Content-Type: application/vnd.api+json" \
             --data @workspace.json \
+            --write-out "\n%{http_code}" \
             "https://app.terraform.io/api/v2/organizations/${TFE_ORGANIZATION}/workspaces")
 
-          workspace_id=$(echo "$response" | jq -r '.data.id')
+          create_status=$(echo "$create_response" | tail -n 1)
+          create_body=$(echo "$create_response" | sed '$d')
 
-          if [ -z "$workspace_id" ] || [ "$workspace_id" = "null" ]; then
-            echo "Failed to create workspace."
-            echo "$response"
-            exit 1
+          if [ "$create_status" = "201" ]; then
+            workspace_id=$(echo "$create_body" | jq -r '.data.id')
+
+            if [ -z "$workspace_id" ] || [ "$workspace_id" = "null" ]; then
+              echo "Workspace was created but its ID could not be determined."
+              echo "$create_body"
+              exit 1
+            fi
+
+            echo "Workspace created: ${workspace_name}"
+            echo "Workspace ID: ${workspace_id}"
+            echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+          if [ "$create_status" = "422" ]; then
+            echo "Workspace creation returned 422. It may have been created concurrently."
+            echo "Retrieving existing workspace..."
 
-          echo "Workspace created: ${workspace_name}"
-          echo "Workspace ID: ${workspace_id}"
+            get_response=$(curl \
+              --fail \
+              --silent \
+              --show-error \
+              --request GET \
+              --header "Authorization: Bearer ${TFE_TOKEN}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$workspace_url")
 
-      - name: Upload Configuration and Trigger Speculative Run
+            workspace_id=$(echo "$get_response" | jq -r '.data.id')
+
+            if [ -z "$workspace_id" ] || [ "$workspace_id" = "null" ]; then
+              echo "Workspace could not be retrieved after creation returned 422."
+              echo "$get_response"
+              exit 1
+            fi
+
+            echo "Using existing workspace: ${workspace_name}"
+            echo "Workspace ID: ${workspace_id}"
+            echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Failed to create workspace. HTTP status: ${create_status}"
+          echo "$create_body"
+          exit 1
+
+      - name: Upload Configuration and Trigger Run
+        id: run
         env:
           TFE_TOKEN: ${{ steps.secrets.outputs.TFE_TOKEN }}
           WORKSPACE_ID: ${{ steps.workspace.outputs.workspace_id }}
+          PULL_REQUEST_NUMBER: ${{ inputs.strata_pr_number }}
         run: |
+          echo "Creating configuration version..."
+
           cv_response=$(curl \
             --fail \
             --silent \
@@ -199,20 +277,27 @@ jobs:
             --data '{
               "data": {
                 "type": "configuration-versions",
-                "attributes": {
-                  "speculative": true
-                }
+                "attributes": {}
               }
             }' \
             "https://app.terraform.io/api/v2/workspaces/${WORKSPACE_ID}/configuration-versions")
 
+          configuration_version_id=$(echo "$cv_response" | jq -r '.data.id')
           upload_url=$(echo "$cv_response" | jq -r '.data.attributes."upload-url"')
+
+          if [ -z "$configuration_version_id" ] || [ "$configuration_version_id" = "null" ]; then
+            echo "Failed to create configuration version."
+            echo "$cv_response"
+            exit 1
+          fi
 
           if [ -z "$upload_url" ] || [ "$upload_url" = "null" ]; then
             echo "Failed to obtain configuration upload URL."
             echo "$cv_response"
             exit 1
           fi
+
+          echo "Configuration version: ${configuration_version_id}"
 
           curl \
             --fail \
@@ -223,4 +308,54 @@ jobs:
             --data-binary @"payload.tar.gz" \
             "$upload_url"
 
-          echo "Payload uploaded successfully. Speculative plan queued."
+          echo "Configuration uploaded successfully."
+
+          echo "Creating Terraform run..."
+
+          jq -n \
+            --arg workspace_id "$WORKSPACE_ID" \
+            --arg configuration_version_id "$configuration_version_id" \
+            --arg message "Strata PR #${PULL_REQUEST_NUMBER}" \
+            '{
+              data: {
+                type: "runs",
+                attributes: {
+                  message: $message
+                },
+                relationships: {
+                  workspace: {
+                    data: {
+                      type: "workspaces",
+                      id: $workspace_id
+                    }
+                  },
+                  "configuration-version": {
+                    data: {
+                      type: "configuration-versions",
+                      id: $configuration_version_id
+                    }
+                  }
+                }
+              }
+            }' > run.json
+
+          run_response=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${TFE_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data @run.json \
+            "https://app.terraform.io/api/v2/runs")
+
+          run_id=$(echo "$run_response" | jq -r '.data.id')
+
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "Failed to create Terraform run."
+            echo "$run_response"
+            exit 1
+          fi
+
+          echo "Terraform run created: ${run_id}"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
