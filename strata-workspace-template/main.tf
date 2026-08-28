@@ -14,13 +14,14 @@ resource "azapi_update_resource" "resource_group_tags" {
   type        = "Microsoft.Resources/resourceGroups@2021-04-01"
   resource_id = data.azurerm_resource_group.target.id
 
-  body = jsonencode({
+  body = {
     properties = {}
+
     tags = merge(
       data.azurerm_resource_group.target.tags,
       local.processed_tags
     )
-  })
+  }
 }
 
 module "strata_hosting" {
